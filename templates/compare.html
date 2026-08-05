@@ -1,0 +1,104 @@
+{% extends "base.html" %}
+{% block content %}
+<h1>🔬 Comparative Analysis</h1>
+<p class="text-muted">Compare two research papers side‑by‑side.</p>
+
+<div class="row">
+    <div class="col-md-6">
+        <div class="card">
+            <div class="card-header bg-primary text-white">Paper 1</div>
+            <div class="card-body">
+                <input type="file" id="file1" class="form-control" accept=".pdf,.docx,.txt">
+                <button class="btn btn-primary mt-2" onclick="uploadPaper('file1', 'text1')">Upload</button>
+                <textarea id="text1" class="form-control mt-2" rows="6" placeholder="Paste text or upload"></textarea>
+            </div>
+        </div>
+    </div>
+    <div class="col-md-6">
+        <div class="card">
+            <div class="card-header bg-success text-white">Paper 2</div>
+            <div class="card-body">
+                <input type="file" id="file2" class="form-control" accept=".pdf,.docx,.txt">
+                <button class="btn btn-success mt-2" onclick="uploadPaper('file2', 'text2')">Upload</button>
+                <textarea id="text2" class="form-control mt-2" rows="6" placeholder="Paste text or upload"></textarea>
+            </div>
+        </div>
+    </div>
+</div>
+
+<button id="compareBtn" class="btn btn-lg btn-warning mt-3">🔍 Compare</button>
+<div id="comparisonResult" class="mt-4"></div>
+
+<script>
+// Upload paper
+async function uploadPaper(fileInputId, textAreaId) {
+    const fileInput = document.getElementById(fileInputId);
+    if (!fileInput.files || !fileInput.files[0]) {
+        alert('Please select a file first.');
+        return;
+    }
+    const formData = new FormData();
+    formData.append('file', fileInput.files[0]); // Send as 'file' - matches backend
+    
+    document.getElementById(textAreaId).innerHTML = '<div class="spinner-border spinner-border-sm"></div> Uploading...';
+    
+    try {
+        const response = await fetch('/api/upload', {
+            method: 'POST',
+            body: formData
+        });
+        const data = await response.json();
+        if (data.text) {
+            document.getElementById(textAreaId).value = data.text;
+        } else {
+            alert('Upload failed: ' + (data.error || 'Unknown error'));
+            document.getElementById(textAreaId).value = '';
+        }
+    } catch (error) {
+        alert('Upload error: ' + error.message);
+        document.getElementById(textAreaId).value = '';
+    }
+}
+
+// Compare
+document.getElementById('compareBtn').addEventListener('click', async () => {
+    const text1 = document.getElementById('text1').value;
+    const text2 = document.getElementById('text2').value;
+    if (!text1 || !text2) {
+        alert('Please provide text for both papers.');
+        return;
+    }
+    document.getElementById('comparisonResult').innerHTML = '<div class="spinner-border"></div> Comparing...';
+    
+    try {
+        const response = await fetch('/api/compare', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ text1, text2 })
+        });
+        const data = await response.json();
+        document.getElementById('comparisonResult').innerHTML = `
+            <div class="card shadow">
+                <div class="card-header bg-info text-white">📊 Comparison</div>
+                <div class="card-body">
+                    <p style="white-space: pre-wrap;">${data.comparison}</p>
+                </div>
+            </div>
+            <button class="btn btn-sm btn-success mt-2" onclick="downloadText('${encodeURIComponent(data.comparison)}', 'comparison.txt')">📥 Download</button>
+        `;
+    } catch (error) {
+        document.getElementById('comparisonResult').innerHTML = '<div class="alert alert-danger">Comparison failed: ' + error.message + '</div>';
+    }
+});
+
+function downloadText(text, filename) {
+    const blob = new Blob([decodeURIComponent(text)], { type: 'text/plain' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = filename;
+    a.click();
+    URL.revokeObjectURL(url);
+}
+</script>
+{% endblock %}

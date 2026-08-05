@@ -1,0 +1,79 @@
+{% extends "base.html" %}
+{% block content %}
+<h1>📜 Your History</h1>
+<p class="text-muted">Your past chats and summaries are saved here.</p>
+
+<div class="row">
+    <div class="col-md-6">
+        <div class="card shadow">
+            <div class="card-header bg-primary text-white">💬 Chat History</div>
+            <div class="card-body" id="chatHistory">
+                <div class="spinner-border"></div> Loading...
+            </div>
+        </div>
+    </div>
+    <div class="col-md-6">
+        <div class="card shadow">
+            <div class="card-header bg-success text-white">📝 Summary History</div>
+            <div class="card-body" id="summaryHistory">
+                <div class="spinner-border"></div> Loading...
+            </div>
+        </div>
+    </div>
+</div>
+
+<script>
+async function loadHistory() {
+    // --- Chat History ---
+    try {
+        const chatRes = await fetch('/api/history');
+        const chatData = await chatRes.json();
+        const chatContainer = document.getElementById('chatHistory');
+        if (chatRes.ok && chatData.length > 0) {
+            let html = '';
+            chatData.forEach(item => {
+                html += `
+                    <div class="border-bottom pb-2 mb-2">
+                        <strong>Q:</strong> ${item.question || 'N/A'}<br>
+                        <strong>A:</strong> ${(item.answer || '').slice(0, 200)}${(item.answer || '').length > 200 ? '...' : ''}<br>
+                        <span class="text-muted small">${item.created_at ? new Date(item.created_at).toLocaleString() : ''}</span>
+                    </div>
+                `;
+            });
+            chatContainer.innerHTML = html || '<p>No chat history found.</p>';
+        } else {
+            chatContainer.innerHTML = '<p>No chat history found. Start chatting!</p>';
+        }
+    } catch (error) {
+        document.getElementById('chatHistory').innerHTML = `<div class="alert alert-danger">Failed to load chat history: ${error.message}</div>`;
+    }
+
+    // --- Summary History ---
+    try {
+        const sumRes = await fetch('/api/summary_history');
+        const sumData = await sumRes.json();
+        const sumContainer = document.getElementById('summaryHistory');
+        if (sumRes.ok && sumData.length > 0) {
+            let html = '';
+            sumData.forEach(item => {
+                html += `
+                    <div class="border-bottom pb-2 mb-2">
+                        <strong>Paper:</strong> ${item.paper_name || 'Unknown'}<br>
+                        <strong>Method:</strong> ${item.summary_method || 'N/A'}<br>
+                        <strong>Summary:</strong> ${(item.summary || '').slice(0, 150)}${(item.summary || '').length > 150 ? '...' : ''}<br>
+                        <span class="text-muted small">${item.created_at ? new Date(item.created_at).toLocaleString() : ''}</span>
+                    </div>
+                `;
+            });
+            sumContainer.innerHTML = html || '<p>No summary history found.</p>';
+        } else {
+            sumContainer.innerHTML = '<p>No summary history found. Generate some summaries!</p>';
+        }
+    } catch (error) {
+        document.getElementById('summaryHistory').innerHTML = `<div class="alert alert-danger">Failed to load summary history: ${error.message}</div>`;
+    }
+}
+
+loadHistory();
+</script>
+{% endblock %}

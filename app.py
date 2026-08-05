@@ -1,81 +1,86 @@
-"""
-Transparent Multi-Stage NLP Analysis Engine & Research Assistant
-Advanced research paper analyzer with summarization, entity recognition, and export features.
-"""
-import streamlit as st
-import pandas as pd
-import numpy as np
-import matplotlib.pyplot as plt
-import seaborn as sns
-import networkx as nx
+from dotenv import load_dotenv
+load_dotenv()
+import os
+os.environ["HF_TOKEN"] = os.getenv("HF_TOKEN", "")
+
+from flask import Flask, render_template, request, jsonify, session, redirect, url_for
+from flask_cors import CORS
+from supabase import create_client, Client
+import json
+from datetime import datetime
 import re
+import hashlib
+from io import BytesIO
 import nltk
 from nltk.corpus import stopwords
 from nltk.tokenize import word_tokenize, sent_tokenize
-from sklearn.feature_extraction.text import CountVectorizer, TfidfVectorizer
-from sklearn.model_selection import train_test_split
-from sklearn.naive_bayes import MultinomialNB
-from sklearn.linear_model import LogisticRegression
-from sklearn.svm import LinearSVC
-from sklearn.metrics import confusion_matrix, classification_report, accuracy_score
-from sklearn.metrics.pairwise import cosine_similarity
+from sklearn.feature_extraction.text import TfidfVectorizer
+import numpy as np
 import spacy
 import warnings
-import json
-from datetime import datetime
-import tempfile
-import os
-from io import BytesIO
-from wordcloud import WordCloud
-
 warnings.filterwarnings('ignore')
 
-# ---------- RAG & ML Imports ----------
-try:
-    import chromadb
-    from chromadb.utils import embedding_functions
-    from sentence_transformers import SentenceTransformer
-    import ollama
-    RAG_AVAILABLE = True
-except ImportError:
-    RAG_AVAILABLE = False
-    print("RAG dependencies not installed. Install: pip install chromadb sentence-transformers ollama")
+# ========== RAG & GROQ IMPORTS ==========
+import ollama
+from sentence_transformers import SentenceTransformer
+import chromadb
+import concurrent.futures
+import groq
 
-from collections import Counter
-import matplotlib.pyplot as plt
-import seaborn as sns
-import pandas as pd
-import numpy as np
-import re
+# ========== APP SETUP ==========
+app = Flask(__name__)
+app.secret_key = os.urandom(24)
+CORS(app)
 
-# ---------- File handling imports ----------
-try:
-    import PyPDF2
-except ImportError:
-    PyPDF2 = None
-try:
-    import pdfplumber
-except ImportError:
-    pdfplumber = None
-try:
-    import docx
-except ImportError:
-    docx = None
+SUPABASE_URL = os.getenv("SUPABASE_URL", "https://mqjyvqhjhtrjymcriuvx.supabase.co")
+SUPABASE_KEY = os.getenv("SUPABASE_KEY", "sb_publishable_FjqLD74vzT-Zj4-tg53ETA_XdECmPz2")
+supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
-# ---------- Dependency Setup ----------
-@st.cache_resource
+# Initialize Groq client
+groq_client = groq.Groq(api_key=os.getenv("GROQ_API_KEY"))
+
+# ========== GLOBAL STATE ==========
+class PaperStore:
+    def __init__(self):
+        self.text = ""
+        self.filename = ""
+        self.chunks = []
+        self.collection = None
+        self.embedding_model = None
+        self.text_quality = {"valid": False, "issues": []}
+        self.metadata = {}
+    
+    def reset(self):
+        self.text = ""
+        self.filename = ""
+        self.chunks = []
+        self.collection = None
+        self.text_quality = {"valid": False, "issues": []}
+        self.metadata = {}
+    
+    def set_paper(self, text, filename):
+        self.text = text
+        self.filename = filename
+        self.metadata = {
+            "word_count": len(text.split()),
+            "char_count": len(text),
+            "line_count": len(text.split('\n')),
+            "uploaded_at": datetime.now().isoformat()
+        }
+
+PAPER_STORE = PaperStore()
+
+# ========== NLP SETUP ==========
 def load_nlp():
     try:
         nlp = spacy.load("en_core_web_sm")
     except OSError:
         import subprocess
-        subprocess.run(["python", "-m", "spacy", "download", "en_core_web_sm"])
+        subprocess.run(["python", "-m", "spacy", "download", "en_core_web_sm"], capture_output=True)
         nlp = spacy.load("en_core_web_sm")
     return nlp
 
-@st.cache_resource
 def load_nltk_data():
-    """Download NLTK stopwords and tokenization resources."""
     resources = [
         ('tokenizers/punkt', 'punkt'),
         ('tokenizers/punkt_tab', 'punkt_tab'),
@@ -87,345 +92,382 @@ def load_nltk_data():
         except LookupError:
             try:
                 nltk.download(pkg, quiet=True)
-            except Exception as e:
-                st.warning(f"Could not download NLTK resource '{pkg}': {e}")
+            except:
+                pass
     return stopwords.words('english')
 
-# Global loading
-try:
-    nlp = load_nlp()
-except Exception as e:
-    st.error(f"Failed to load spaCy model: {e}")
-    st.stop()
+nlp = load_nlp()
+stop_words = load_nltk_data()
 
-try:
-    stop_words = load_nltk_data()
-except Exception as e:
-    st.error(f"Failed to load NLTK data: {e}")
-    st.stop()
-
-# Custom stopwords
 KEEP_TOKENS = {'not', 'no', 'never', 'before', 'after', 'why', 'must', 'should', 'could', 'would'}
 STOPWORDS_FILTERED = [w for w in stop_words if w not in KEEP_TOKENS]
 
-# Emoji & Hashtag Mappings
-EMOJI_MAP = {
-    "😂": "<LAUGH_EMOJI>", "😊": "<POSITIVE_EMOJI>", "😡": "<ANGRY_EMOJI>",
-    "😢": "<SAD_EMOJI>", "😏": "<SARCASM_EMOJI>", "❤️": "<HEART_EMOJI>",
-    "🔥": "<FIRE_EMOJI>", "💯": "<HUNDRED_EMOJI>", "⭐": "<STAR_EMOJI>"
-}
-SARCASM_INDICATORS = ["🙄", "😒", "😑"]
+# ========== ULTRA-AGGRESSIVE TEXT CLEANER ==========
+import pdfplumber
 
-# ---------- Improved Summarization Helpers ----------
-def clean_text_for_sentences(text):
-    """Clean text to improve sentence tokenization."""
-    text = text.replace('\n', ' ').replace('\r', ' ')
-    text = re.sub(r' +', ' ', text)
-    text = re.sub(r'([.!?])([A-Z])', r'\1 \2', text)
-    return text
+class UltraAggressiveTextCleaner:
+    def __init__(self):
+        self.common_words = {
+            'the','a','an','and','or','but','in','on','at','to','for',
+            'of','with','from','by','as','is','are','was','were','be',
+            'have','has','had','do','does','did','can','could','will',
+            'would','should','may','might','must','shall','this','that',
+            'these','those','i','you','he','she','it','we','they',
+            'what','which','who','when','where','why','how','all','each',
+            'every','both','neither','either','no','not','only','same',
+            'such','so','than','then','now','here','there','about',
+            'also','more','most','less','least','very','much','many',
+            'few','some','any','several','another','other',
+            'our','your','his','her','its','their','my','me','him',
+            'us','them',
+            'research','study','paper','analysis','results','method',
+            'approach','theory','model','system','data','show',
+            'demonstrate','found','suggest','propose','develop','improve',
+            'achieve','performance','effectiveness','efficiency','impact',
+            'project','management','success','practices','benefits',
+            'framework','governance','implementation','conclusion',
+            'abstract','introduction','discussion','evaluation'
+        }
     
-    
-def split_sentences(text):
-    """
-    Robust sentence splitting with filters for:
-    - Citations
-    - Interview questions
-    - Overly definitional sentences
-    - Boosting for result‑bearing sentences
-    """
-    # 1. Clean up
-    text = clean_text_for_sentences(text)
-
-    # 2. Split into sentences
-    try:
-        sentences = sent_tokenize(text)
-    except:
-        sentences = []
-
-    if len(sentences) < 2:
-        sentences = re.split(r'(?<=[.!?])\s+', text)
-
-    sentences = [s.strip() for s in sentences if len(s.split()) >= 5]
-
-    if len(sentences) <= 1:
-        sentences = re.split(r'\.\s*', text)
-        sentences = [s.strip() + '.' for s in sentences if len(s.split()) >= 5]
-
-    # 3. Helper filters
-    def is_citation_sentence(sent):
-        # Parenthetical citations count
-        if len(re.findall(r'\([A-Z][a-z]+\s*[,;]?\s*\d{4}\)', sent)) >= 2:
-            return True
-        if re.match(r'^[A-Z][a-z]+,\s*[A-Z]\.?\s*\(\d{4}\)', sent):
-            return True
-        if re.search(r'et al\.\s*[,;]?\s*\d{4}', sent):
-            return True
-        if len(re.findall(r'[A-Z][a-z]+\s*[,;]?\s*[A-Z]\.', sent)) >= 3:
-            return True
-        if re.match(r'^[A-Z][a-z]+\s+[A-Z][a-z]+\s*,?\s*\d{4}[,.]', sent):
-            return True
-        return False
-
-    def is_question_sentence(sent):
-        # Starts with interrogative words
-        if re.match(r'^(Do|Does|Did|Is|Are|Was|Were|Why|What|When|How|Where|Which)\s', sent):
-            return True
-        return False
-
-    def is_definition_sentence(sent):
-        # Contains "is defined as", "can be defined as", or many quoted fragments
-        if re.search(r'\bis defined as\b|\bcan be defined as\b', sent, re.I):
-            return True
-        # More than two quoted segments (likely definitions)
-        if len(re.findall(r'"[^"]+"', sent)) >= 2:
-            return True
-        if len(re.findall(r'\([^)]+\)', sent)) >= 3:  # heavy parentheticals
-            return True
-        return False
-
-    # 4. Score and filter
-    scored_sentences = []
-    for sent in sentences:
-        if is_citation_sentence(sent) or is_question_sentence(sent) or is_definition_sentence(sent):
-            continue  # drop it
-
-        # Base score
-        score = 0
-
-        # Boost for result keywords
-        if re.search(r'\b(results|findings|showed|demonstrated|indicated|revealed|engaged|practiced|used|reported)\b', sent, re.I):
-            score += 30
-        # Boost for numbers/percentages (findings)
-        if re.search(r'\b\d+%|\b\d+\s*(?:participants|students|subjects|interviewees)\b', sent, re.I):
-            score += 20
-        # Boost for sentences that mention the study itself
-        if re.search(r'\b(study|research|paper|article)\b', sent, re.I):
-            score += 10
-
-        scored_sentences.append((sent, score))
-
-    # Sort by score descending, then by original order (keep stable)
-    scored_sentences.sort(key=lambda x: (-x[1], sentences.index(x[0])))
-
-    # Return all sentences (you could limit to top N here, but TextRank will choose)
-    return [s for s, _ in scored_sentences] if scored_sentences else sentences
-    return sorted_sentences
-def textrank_summarize(text, num_sentences=5):
-    sentences = split_sentences(text)
-    if len(sentences) <= num_sentences:
-        return ' '.join(sentences)
-    
-    try:
-        vectorizer = TfidfVectorizer(stop_words='english')
-        tfidf_matrix = vectorizer.fit_transform(sentences)
-        similarity_matrix = (tfidf_matrix * tfidf_matrix.T).toarray()
-    except:
-        similarity_matrix = np.zeros((len(sentences), len(sentences)))
-        for i in range(len(sentences)):
-            words_i = set(word_tokenize(sentences[i].lower()))
-            for j in range(len(sentences)):
-                if i != j:
-                    words_j = set(word_tokenize(sentences[j].lower()))
-                    if words_i and words_j:
-                        similarity_matrix[i][j] = len(words_i & words_j) / (len(words_i | words_j) + 1e-8)
-    
-    scores = np.ones(len(sentences)) / len(sentences)
-    for _ in range(10):
-        new_scores = np.zeros(len(sentences))
-        for i in range(len(sentences)):
-            for j in range(len(sentences)):
-                if i != j and similarity_matrix[i][j] > 0:
-                    new_scores[i] += similarity_matrix[i][j] * scores[j] / (np.sum(similarity_matrix[:, j]) + 1e-8)
-        scores = 0.85 * new_scores + 0.15 / len(sentences)
-    
-    top_indices = np.argsort(scores)[-num_sentences:][::-1]
-    summary = ' '.join(sentences[i] for i in sorted(top_indices))
-    return summary
-
-def generate_summary_tfidf(text, num_sentences=5):
-    sentences = split_sentences(text)
-    if len(sentences) <= num_sentences:
-        return ' '.join(sentences)
-    vectorizer = TfidfVectorizer(stop_words='english')
-    try:
-        tfidf = vectorizer.fit_transform(sentences)
-        scores = tfidf.sum(axis=1).A1
-        ranked = sorted(range(len(sentences)), key=lambda i: scores[i], reverse=True)[:num_sentences]
-        return ' '.join(sentences[i] for i in sorted(ranked))
-    except:
-        return ' '.join(sentences[:num_sentences])
-
-def generate_summary_frequency(text, num_sentences=5):
-    sentences = split_sentences(text)
-    if len(sentences) <= num_sentences:
-        return ' '.join(sentences)
-    words = re.findall(r'\b[a-zA-Z]+\b', text.lower())
-    words = [w for w in words if w not in stop_words]
-    from collections import Counter
-    freq = Counter(words)
-    scores = []
-    for sent in sentences:
-        sent_words = re.findall(r'\b[a-zA-Z]+\b', sent.lower())
-        sent_score = sum(freq.get(w, 0) for w in sent_words)
-        scores.append(sent_score / (len(sent_words) + 1))
-    ranked = sorted(range(len(sentences)), key=lambda i: scores[i], reverse=True)[:num_sentences]
-    return ' '.join(sentences[i] for i in sorted(ranked))
-
-# ---------- Advanced PDF Extraction ----------
-def extract_text_from_pdf_pypdf2(file_bytes):
-    if PyPDF2 is None:
-        return ""
-    reader = PyPDF2.PdfReader(BytesIO(file_bytes))
-    text = ""
-    for page in reader.pages:
-        page_text = page.extract_text()
-        if page_text:
-            text += page_text + "\n"
-    return text
-
-def extract_text_from_pdf_pdfplumber(file_bytes):
-    if pdfplumber is None:
-        return ""
-    text = ""
-    with pdfplumber.open(BytesIO(file_bytes)) as pdf:
-        for page in pdf.pages:
-            page_text = page.extract_text()
-            if page_text:
-                page_text = re.sub(r'\b\d+\s*$', '', page_text, flags=re.MULTILINE)
-                page_text = re.sub(r'^\s*\d+\s*$', '', page_text, flags=re.MULTILINE)
-                text += page_text + "\n"
-    return text
-
-def extract_text_from_file(uploaded_file, use_advanced=True):
-    if uploaded_file is None:
-        return ""
-    
-    file_type = uploaded_file.type
-    file_bytes = uploaded_file.read()
-    
-    if file_type == "application/pdf":
-        if use_advanced and pdfplumber is not None:
-            try:
-                text = extract_text_from_pdf_pdfplumber(file_bytes)
-                if text and len(text.strip()) > 100:
-                    return text
-            except Exception as e:
-                st.warning(f"pdfplumber extraction failed: {e}")
-        
-        if PyPDF2 is not None:
-            try:
-                text = extract_text_from_pdf_pypdf2(file_bytes)
-                if text:
-                    return text
-            except Exception as e:
-                st.warning(f"PyPDF2 extraction failed: {e}")
-        
-        return "Could not extract text from PDF. The file may be scanned or protected."
-    
-    elif file_type == "application/vnd.openxmlformats-officedocument.wordprocessingml.document":
-        if docx is not None:
-            doc = docx.Document(BytesIO(file_bytes))
-            return "\n".join([para.text for para in doc.paragraphs])
-        else:
-            return "DOCX support not available. Install python-docx: pip install python-docx"
-    
-    else:
+    def extract_from_pdf(self, file_bytes, max_pages=50):
         try:
-            return file_bytes.decode("utf-8")
-        except UnicodeDecodeError:
-            try:
-                return file_bytes.decode("latin-1")
-            except:
-                return "Could not decode file. Please ensure it's a valid text file."
-
-# ---------- Preprocessing Functions ----------
-def safe_preprocess(text: str) -> dict:
-    original = text
-    audit = []
-    protected = {}
-
-    def protect(text, pattern, placeholder):
-        matches = re.findall(pattern, text)
-        for i, m in enumerate(matches):
-            key = f"__PROTECTED_{placeholder}_{i}__"
-            protected[key] = m
-            text = text.replace(m, key)
+            with pdfplumber.open(BytesIO(file_bytes)) as pdf:
+                full_text = []
+                pages_to_read = min(len(pdf.pages), max_pages)
+                for i, page in enumerate(pdf.pages[:pages_to_read]):
+                    text = page.extract_text()
+                    if text and len(text.strip()) > 20:
+                        full_text.append(text)
+                if not full_text:
+                    raise Exception("No text extracted")
+                return "\n\n".join(full_text)
+        except Exception as e:
+            raise Exception(f"PDF extraction failed: {e}")
+    
+    def clean_aggressively(self, text):
+        text = self._step1_preprocess(text)
+        text = self._step2_split_words(text)
+        text = self._step3_word_boundaries(text)
+        text = self._step4_punctuation(text)
+        text = self._step5_whitespace(text)
+        text = self._step6_junk_removal(text)
+        text = self._step7_sections(text)
+        return text
+    
+    def _step1_preprocess(self, text):
+        text = re.sub(r'[\u00A0\u1680\u2000-\u200B\u202F\u205F\u3000]', ' ', text)
+        text = re.sub(r'([a-z])([A-Z])', r'\1 \2', text)
+        text = re.sub(r'([a-zA-Z])(\d)', r'\1 \2', text)
+        text = re.sub(r'(\d)([a-zA-Z])', r'\1 \2', text)
+        text = re.sub(r'([.!?,:;])([A-Za-z0-9])', r'\1 \2', text)
+        text = re.sub(r'([a-zA-Z0-9])([.!?,:;])', r'\1\2', text)
+        return text
+    
+    def _step2_split_words(self, text):
+        def smart_split(word):
+            if len(word) < 4 or ' ' in word:
+                return word
+            word_lower = word.lower()
+            for i in range(2, len(word) - 1):
+                left = word_lower[:i]
+                right = word_lower[i:]
+                if left in self.common_words:
+                    right_split = smart_split(right)
+                    return f"{word[:i]} {right_split}"
+            return word
+        pattern = r'\b[a-z]{3,}(?=[a-z]{2,})[a-z]*\b'
+        text = re.sub(pattern, lambda m: smart_split(m.group(0)), text, flags=re.IGNORECASE)
+        return text
+    
+    def _step3_word_boundaries(self, text):
+        fixes = [
+            (r'([a-z])and([A-Z])', r'\1 and \2'),
+            (r'([a-z])or([A-Z])', r'\1 or \2'),
+            (r'([a-z])the([A-Z])', r'\1 the \2'),
+            (r'([a-z])in([A-Z])', r'\1 in \2'),
+            (r'([a-z])is([A-Z])', r'\1 is \2'),
+            (r'([a-z])are([A-Z])', r'\1 are \2'),
+            (r'([a-z])was([A-Z])', r'\1 was \2'),
+            (r'([a-z])were([A-Z])', r'\1 were \2'),
+            (r'([a-z])be([A-Z])', r'\1 be \2'),
+            (r'([a-z])et([a-z])', r'\1 et \2'),
+        ]
+        for pattern, replacement in fixes:
+            text = re.sub(pattern, replacement, text, flags=re.I)
+        return text
+    
+    def _step4_punctuation(self, text):
+        text = re.sub(r'([.!?,:;])([A-Za-z])', r'\1 \2', text)
+        text = re.sub(r'\s+([.!?,:;)])', r'\1', text)
+        return text
+    
+    def _step5_whitespace(self, text):
+        text = text.replace('\t', ' ')
+        text = re.sub(r'\n{3,}', '\n\n', text)
+        text = re.sub(r' {2,}', ' ', text)
+        text = re.sub(r'\n +', '\n', text)
+        text = re.sub(r' +\n', '\n', text)
+        return text.strip()
+    
+    def _step6_junk_removal(self, text):
+        lines = text.split('\n')
+        cleaned = []
+        for line in lines:
+            stripped = line.strip()
+            if not stripped or len(stripped) < 3:
+                continue
+            if re.match(r'^[\d\-–—\s]*$', stripped):
+                continue
+            if not re.search(r'[a-zA-Z]', stripped):
+                continue
+            alpha = len(re.findall(r'[a-zA-Z0-9]', stripped))
+            if alpha < len(stripped) * 0.6:
+                continue
+            if re.search(r'([^a-zA-Z0-9 ])\1{3,}', stripped):
+                continue
+            cleaned.append(line)
+        return '\n'.join(cleaned)
+    
+    def _step7_sections(self, text):
+        text = re.sub(
+            r'\n\s*(?:REFERENCES|References|BIBLIOGRAPHY|Bibliography|APPENDIX|Appendix|ACKNOWLEDGEMENTS).*',
+            '',
+            text,
+            flags=re.IGNORECASE | re.DOTALL
+        )
         return text
 
-    text = protect(text, r'https?://\S+', 'URL')
-    text = protect(text, r'\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b', 'EMAIL')
-    text = protect(text, r'\b\d{1,2}/\d{1,2}/\d{2,4}\b', 'DATE')
-    text = protect(text, r'\b\d{1,2}:\d{2}(?::\d{2})?\s?(?:AM|PM)?\b', 'TIME')
-    text = protect(text, r'\b[A-Za-z]+\d+[A-Za-z]*\b', 'CODEID')
-    text = protect(text, r'\bC\+\+\b', 'CODEID')
+# ========== TEXT VALIDATOR ==========
+class TextValidator:
+    @staticmethod
+    def assess_quality(text):
+        issues = []
+        word_count = len(text.split())
+        if word_count < 100:
+            issues.append("Text too short (< 100 words)")
+        english_words = sum(1 for w in text.split() if len(w) > 2)
+        if english_words < word_count * 0.7:
+            issues.append("Low English word ratio")
+        avg_word_len = sum(len(w) for w in text.split()) / max(len(text.split()), 1)
+        if avg_word_len < 3 or avg_word_len > 12:
+            issues.append(f"Unusual average word length: {avg_word_len:.1f}")
+        sentences = re.split(r'[.!?]', text)
+        if len(sentences) < 3:
+            issues.append("Very few sentences detected")
+        return {
+            "valid": len(issues) == 0,
+            "issues": issues,
+            "word_count": word_count,
+            "quality_score": max(0, 100 - len(issues) * 20)
+        }
 
-    for emoji, token in EMOJI_MAP.items():
-        if emoji in text:
-            text = text.replace(emoji, token)
-            audit.append(f"Replaced {emoji} with {token}")
-    for emoji in SARCASM_INDICATORS:
-        if emoji in text:
-            text = text.replace(emoji, "<SARCASM_EMOJI>")
-            audit.append(f"Replaced {emoji} with <SARCASM_EMOJI>")
+# ========== SENTENCE SPLITTING ==========
+def split_sentences(text):
+    abbreviations = [
+        r'\b(?:Dr|Mr|Mrs|Ms|Prof|Sr|Jr|Ph\.D|U\.S|U\.K|U\.N|NATO|NASA|WHO)\b',
+        r'\b(?:e\.g|i\.e|etc|vs|viz)\b'
+    ]
+    text_marked = text
+    for abbr_pattern in abbreviations:
+        def replace_abbr(match):
+            return match.group(0).replace('.', '___DOT___')
+        text_marked = re.sub(abbr_pattern, replace_abbr, text_marked, flags=re.IGNORECASE)
+    sentences = re.split(r'(?<=[.!?])\s+', text_marked)
+    sentences = [s.replace('___DOT___', '.').strip() for s in sentences]
+    sentences = [s for s in sentences if s and len(s.split()) >= 5 and len(s) > 15]
+    return sentences
 
-    def split_hashtag(match):
-        tag = match.group(1)
-        words = re.findall(r'[A-Z][a-z]*|[a-z]+', tag)
-        return ' '.join(words)
-    text = re.sub(r'#(\w+)', lambda m: split_hashtag(m), text)
+# ========== SUMMARIZATION ENGINE ==========
+class SummarizationEngine:
+    def __init__(self):
+        self.cleaner = UltraAggressiveTextCleaner()
 
-    def lower_except_acronyms(t):
-        if re.fullmatch(r'[A-Z]{2,}', t) or re.fullmatch(r'[A-Z]\.', t):
-            return t
-        if re.fullmatch(r'__PROTECTED_\w+__', t):
-            return t
-        return t.lower()
-    words = re.findall(r'\S+', text)
-    words = [lower_except_acronyms(w) for w in words]
-    text = ' '.join(words)
+    def _filter_sentences(self, sentences):
+        filtered = []
+        for sent in sentences:
+            if len(re.findall(r'[a-zA-Z]', sent)) / max(len(sent), 1) < 0.5:
+                continue
+            if re.match(r'^\d+\.\s+[A-Z]', sent) or re.match(r'^(?:Figure|Fig|Table)\s+\d+', sent, re.I) or 'et al' in sent.lower():
+                continue
+            if len(sent.split()) > 100:
+                continue
+            filtered.append(sent)
+        return filtered
 
-    for key, val in protected.items():
-        text = text.replace(key, val)
+    def textrank_summarize(self, text, num_sentences=8):
+        sentences = split_sentences(text)
+        if len(sentences) <= num_sentences:
+            return ' '.join(sentences)
+        filtered = self._filter_sentences(sentences)
+        if len(filtered) < num_sentences:
+            filtered = sentences
+        sentences = filtered[:150]
+        # Scoring
+        section_keywords = {
+            'abstract': r'\b(abstract|overview|summary|purpose)\b',
+            'results': r'\b(results|findings|outcomes|achieved|demonstrated|showed|revealed|found|indicate)\b',
+            'conclusion': r'\b(conclusion|conclude|concluding|implications|summary)\b',
+            'discussion': r'\b(discussion|discuss|suggests|propose)\b',
+            'methods': r'\b(method|methods|approach|technique|proposed)\b'
+        }
+        importance_keywords = {
+            'significant': 40, 'novel': 35, 'outperform': 35,
+            'improve': 30, 'achieve': 30, 'demonstrate': 30,
+            'superior': 35, 'effective': 25, 'efficient': 25,
+            'performance': 25, 'empirical': 25, 'evidence': 25,
+            'breakthrough': 40, 'unprecedented': 40
+        }
+        sentence_scores = {}
+        for i, sent in enumerate(sentences):
+            score = 0
+            sent_lower = sent.lower()
+            for section, pattern in section_keywords.items():
+                if re.search(pattern, sent_lower):
+                    score += 25 if section in ['abstract', 'results', 'conclusion'] else 15
+                    break
+            for keyword, boost in importance_keywords.items():
+                if keyword in sent_lower:
+                    score += boost
+            score += (1.0 - i/len(sentences)) * 10
+            if re.search(r'^\d+\.\s*[A-Z]', sent):
+                score -= 30
+            sentence_scores[i] = max(score, 0)
 
-    doc = nlp(text)
-    tokens = [token.text for token in doc]
-    tokens_filtered = [t for t in tokens if t.lower() not in STOPWORDS_FILTERED]
+        try:
+            vectorizer = TfidfVectorizer(stop_words='english', max_features=500, ngram_range=(1, 2))
+            tfidf_matrix = vectorizer.fit_transform(sentences)
+            similarity_matrix = (tfidf_matrix * tfidf_matrix.T).toarray()
+            similarity_matrix = similarity_matrix / (np.max(similarity_matrix) + 1e-8)
+        except:
+            similarity_matrix = np.eye(len(sentences))
 
-    filtered_text = ' '.join(tokens_filtered)
-    doc_filtered = nlp(filtered_text)
-    lemmatized_filtered = []
-    for token in doc_filtered:
-        if token.text in protected.values() or (token.text.startswith('<') and token.text.endswith('>')):
-            lemmatized_filtered.append(token.text)
-        else:
-            if token.pos_ in ('VERB', 'NOUN', 'ADJ', 'ADV'):
-                lemmatized_filtered.append(token.lemma_)
-            else:
-                lemmatized_filtered.append(token.text)
+        scores = np.ones(len(sentences)) / len(sentences)
+        damping = 0.85
+        for _ in range(30):
+            new_scores = np.zeros(len(sentences))
+            for i in range(len(sentences)):
+                weighted = sum(similarity_matrix[i][j] * scores[j] for j in range(len(sentences)) if i != j)
+                new_scores[i] = weighted / (np.sum(similarity_matrix[:, i]) + 1e-8)
+            scores = damping * new_scores + (1 - damping) / len(sentences)
 
-    audit.append(f"Protected entities: {list(protected.keys())}")
-    audit.append(f"Emojis mapped: {[e for e in EMOJI_MAP if e in original]}")
-    audit.append(f"Hashtags split: {re.findall(r'#\w+', original)}")
-    audit.append(f"Stopwords removed (kept exceptions: {KEEP_TOKENS})")
+        boost_scores = np.array([sentence_scores.get(i, 0) for i in range(len(sentences))])
+        if np.max(boost_scores) > 0:
+            boost_scores = boost_scores / np.max(boost_scores)
+        scores = scores / (np.max(scores) + 1e-8)
+        final_scores = 0.65 * scores + 0.35 * boost_scores
 
-    return {
-        'original': original,
-        'protected': protected,
-        'tokens_raw': tokens,
-        'tokens_filtered': tokens_filtered,
-        'lemmatized_filtered': lemmatized_filtered,
-        'audit': audit
-    }
+        top_indices = np.argsort(final_scores)[-num_sentences*2:][::-1]
+        selected = []
+        for idx in top_indices:
+            sent = sentences[idx]
+            is_dup = any(
+                len(set(sent.split()) & set(s.split())) / len(set(sent.split()) | set(s.split())) > 0.65
+                for s in selected
+            )
+            if not is_dup:
+                selected.append(sent)
+            if len(selected) >= num_sentences:
+                break
+        return ' '.join(selected) if selected else self.tfidf_summarize(text, num_sentences)
 
-def naive_preprocess(text: str) -> list:
+    def tfidf_summarize(self, text, num_sentences=5):
+        sentences = split_sentences(text)
+        if len(sentences) <= num_sentences:
+            return ' '.join(sentences)
+        try:
+            vectorizer = TfidfVectorizer(stop_words='english', max_features=500)
+            tfidf = vectorizer.fit_transform(sentences)
+            scores = tfidf.sum(axis=1).A1
+            ranked = sorted(range(len(sentences)), key=lambda i: scores[i], reverse=True)[:num_sentences]
+            return ' '.join(sentences[i] for i in sorted(ranked))
+        except:
+            return ' '.join(sentences[:num_sentences])
+
+    def frequency_summarize(self, text, num_sentences=5):
+        sentences = split_sentences(text)
+        if len(sentences) <= num_sentences:
+            return ' '.join(sentences)
+        filtered = self._filter_sentences(sentences)
+        if len(filtered) < num_sentences:
+            filtered = sentences
+        extended_stops = set(stop_words)
+        extended_stops.update({'et','al','paper','study','research','result','show','find','propose','use','would','could'})
+        words = [w for w in re.findall(r'\b[a-zA-Z]+\b', text.lower()) if w not in extended_stops and len(w) > 3]
+        try:
+            vectorizer = TfidfVectorizer(stop_words='english', max_features=200)
+            tfidf = vectorizer.fit_transform(filtered)
+            word_weights = dict(zip(vectorizer.get_feature_names_out(), tfidf.sum(axis=0).A1))
+        except:
+            from collections import Counter
+            word_weights = dict(Counter(words).most_common(200))
+        importance_words = {'accuracy':50,'performance':40,'improvement':45,'efficient':40,'effective':40,
+                            'superior':45,'significant':40,'novel':45,'outperform':45}
+        scores = []
+        for sent in filtered:
+            sent_words = [w for w in re.findall(r'\b[a-zA-Z]+\b', sent.lower()) if len(w) > 3]
+            score = sum(word_weights.get(w, 0) for w in sent_words) / (len(sent_words) + 1)
+            for word, boost in importance_words.items():
+                if word in sent.lower():
+                    score += boost
+            if re.search(r'\b(demonstrate|show|indicate|reveal|conclude|suggest)\b', sent.lower()):
+                score *= 1.3
+            if re.search(r'\bet al\.\b', sent, re.I):
+                score *= 0.6
+            scores.append((sent, score))
+        scores.sort(key=lambda x: x[1], reverse=True)
+        selected = []
+        for sent, _ in scores:
+            is_dup = any(
+                len(set(sent.split()) & set(s.split())) / len(set(sent.split()) | set(s.split())) > 0.65
+                for s in selected
+            )
+            if not is_dup:
+                selected.append(sent)
+            if len(selected) >= num_sentences:
+                break
+        return ' '.join(selected) if selected else self.tfidf_summarize(text, num_sentences)
+
+summarizer = SummarizationEngine()
+
+# ========== EMBEDDING MODEL ==========
+_embedding_model = None
+def get_embedding_model():
+    global _embedding_model
+    if _embedding_model is None:
+        _embedding_model = SentenceTransformer('all-MiniLM-L6-v2')
+    return _embedding_model
+
+def build_index(text):
+    words = text.split()
+    chunks = []
+    chunk_size = 200
+    overlap = 30
+    for i in range(0, len(words), chunk_size - overlap):
+        chunk = ' '.join(words[i:i+chunk_size])
+        if len(chunk.split()) > 20:
+            chunks.append(chunk)
+    if not chunks:
+        return None
     try:
-        tokens = word_tokenize(text.lower())
-    except LookupError:
-        tokens = text.lower().split()
-    tokens = [t for t in tokens if t.isalnum() and t not in stop_words]
-    return tokens
+        model = get_embedding_model()
+        embeddings = model.encode(chunks, batch_size=32)
+        client = chromadb.Client()
+        collection_name = f"paper_chunks_{hashlib.md5(text[:1000].encode()).hexdigest()[:8]}"
+        try:
+            client.delete_collection(collection_name)
+        except:
+            pass
+        collection = client.create_collection(name=collection_name)
+        for i, (chunk, emb) in enumerate(zip(chunks, embeddings)):
+            collection.add(documents=[chunk], embeddings=[emb.tolist()], ids=[str(i)])
+        PAPER_STORE.chunks = chunks
+        PAPER_STORE.collection = collection
+        return collection
+    except Exception as e:
+        print(f"Index building failed: {e}")
+        return None
 
-# ---------- Research Paper Structure Extraction ----------
+# ========== PAPER STRUCTURE ==========
 def extract_paper_structure(text):
     sections = {
         'title': '', 'abstract': '', 'introduction': '',
@@ -435,7 +477,6 @@ def extract_paper_structure(text):
     lines = [l.strip() for l in text.split('\n') if l.strip()]
     if lines:
         sections['title'] = lines[0][:200]
-    
     section_markers = {
         'abstract': ['abstract', 'summary'],
         'introduction': ['introduction', 'background', 'related work'],
@@ -444,14 +485,11 @@ def extract_paper_structure(text):
         'conclusion': ['conclusion', 'future work'],
         'references': ['reference', 'bibliography']
     }
-    
     current_section = 'other'
     current_text = []
-    
     for line in lines:
         line_lower = line.lower()
         section_found = False
-        
         for section, markers in section_markers.items():
             for marker in markers:
                 if re.match(rf'^{marker}[:\s]', line_lower) or line_lower == marker:
@@ -463,801 +501,495 @@ def extract_paper_structure(text):
                     break
             if section_found:
                 break
-        
         if not section_found:
             current_text.append(line)
-    
     if current_text:
         sections[current_section] += ' '.join(current_text)
-    
     for key in sections:
         sections[key] = sections[key][:2000]
-    
     return sections
 
-# ---------- Named Entity Recognition ----------
-def extract_entities(text):
-    doc = nlp(text)
-    entities = {
-        'PERSON': [], 'ORG': [], 'GPE': [], 'DATE': [],
-        'MONEY': [], 'PERCENT': [], 'PRODUCT': [], 'EVENT': [],
-        'WORK_OF_ART': [], 'LAW': [], 'LANGUAGE': [], 'FAC': []
-    }
-    for ent in doc.ents:
-        if ent.label_ in entities:
-            entities[ent.label_].append(ent.text)
-    
-    for key in entities:
-        entities[key] = list(dict.fromkeys(entities[key]))[:20]
-    
-    return entities
+# ========== WINNING FEATURES ==========
 
-# ---------- Advanced Keyword Extraction ----------
-def extract_keywords(text, top_n=10):
-    vectorizer = TfidfVectorizer(max_features=50, stop_words='english', ngram_range=(1, 2))
+# Feature 2: Surprising Insight Detector
+def detect_surprising_insights(text):
+    system_prompt = "You are a research assistant. Find the most counter-intuitive, surprising, or unexpected finding in this paper. If none found, say 'No surprising insights found.'"
+    user_prompt = f"Paper:\n{text[:4000]}\n\nWhat is the most surprising or counter-intuitive finding?"
     try:
+        response = ollama.chat(
+            model='tinyllama:1.1b',
+            messages=[
+                {'role': 'system', 'content': system_prompt},
+                {'role': 'user', 'content': user_prompt}
+            ],
+            options={'temperature': 0.3, 'max_tokens': 150}
+        )
+        return response['message']['content'].strip()
+    except:
+        try:
+            response = groq_client.chat.completions.create(
+                model="llama-3.1-8b-instant",
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt}
+                ],
+                temperature=0.3,
+                max_tokens=150
+            )
+            return response.choices[0].message.content.strip()
+        except:
+            return "Could not detect surprising insights."
+
+# Feature 3: Comparative Analysis
+def compare_papers(text1, text2):
+    system_prompt = "You are a research analyst. Compare these two research papers. Highlight similarities, differences, and which one has stronger evidence."
+    user_prompt = f"Paper 1:\n{text1[:3000]}\n\nPaper 2:\n{text2[:3000]}\n\nComparison:"
+    try:
+        response = groq_client.chat.completions.create(
+            model="llama-3.1-8b-instant",
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt}
+            ],
+            temperature=0.3,
+            max_tokens=400
+        )
+        return response.choices[0].message.content.strip()
+    except:
+        return "Comparative analysis failed. Please try again."
+
+# Feature 5: Download Full Report
+def generate_full_report(text, summary, keywords, entities, method, filename):
+    report = f"""# 📄 Research Paper Report
+
+## 📌 Paper Information
+- **File:** {filename}
+- **Generated on:** {datetime.now().strftime('%Y-%m-%d %H:%M')}
+- **Method:** {method}
+
+---
+
+## 📊 Summary
+{summary}
+
+---
+
+## 🏷️ Key Terms
+{', '.join([kw[0] for kw in keywords[:15]]) if keywords else 'N/A'}
+
+---
+
+## 🏷️ Named Entities
+"""
+    for k, v in entities.items():
+        if v:
+            report += f"- **{k}**: {', '.join(v[:10])}\n"
+    report += f"""
+---
+
+## 📈 Statistics
+- Total words: {len(text.split())}
+- Summary length: {len(summary.split())} words
+
+---
+*Generated by the NLP Research Assistant*
+"""
+    return report
+
+# ========== ROUTES ==========
+@app.route('/')
+def index():
+    return redirect(url_for('login'))
+
+@app.route('/login', methods=['GET', 'POST'])
+def login():
+    if request.method == 'POST':
+        email = request.form.get('email')
+        password = request.form.get('password')
+        if email == "test@demo.com" and password == "password123":
+            session['user_id'] = "demo_user"
+            session['email'] = "test@demo.com"
+            return redirect(url_for('dashboard'))
+        try:
+            response = supabase.auth.sign_in_with_password({"email": email, "password": password})
+            if response.user:
+                session['user_id'] = response.user.id
+                session['email'] = email
+                return redirect(url_for('dashboard'))
+        except Exception as e:
+            return render_template('login.html', error="Invalid credentials. Try test@demo.com / password123")
+    return render_template('login.html')
+
+@app.route('/signup', methods=['GET', 'POST'])
+def signup():
+    if request.method == 'POST':
+        email = request.form.get('email')
+        password = request.form.get('password')
+        try:
+            supabase.auth.sign_up({"email": email, "password": password})
+            return render_template('login.html', success="Account created! Please login.")
+        except Exception as e:
+            return render_template('signup.html', error=str(e))
+    return render_template('signup.html')
+
+@app.route('/logout')
+def logout():
+    session.clear()
+    PAPER_STORE.reset()
+    return redirect(url_for('login'))
+
+@app.route('/dashboard')
+def dashboard():
+    if 'user_id' not in session:
+        return redirect(url_for('login'))
+    return render_template('dashboard.html', email=session.get('email'))
+
+@app.route('/summary')
+def summary_page():
+    if 'user_id' not in session:
+        return redirect(url_for('login'))
+    return render_template('summary.html')
+
+@app.route('/chat')
+def chat_page():
+    if 'user_id' not in session:
+        return redirect(url_for('login'))
+    return render_template('chat.html')
+
+# ========== API ==========
+@app.route('/api/upload', methods=['POST'])
+def upload():
+    if 'file' not in request.files:
+        return jsonify({"error": "No file uploaded"}), 400
+    
+    file = request.files['file']
+    filename = file.filename
+    file_bytes = file.read()
+    
+    try:
+        print(f"\n{'='*60}")
+        print(f"📤 UPLOAD: {filename}")
+        print(f"{'='*60}")
+        
+        cleaner = UltraAggressiveTextCleaner()
+        
+        if filename.lower().endswith('.pdf'):
+            text = cleaner.extract_from_pdf(file_bytes)
+        elif filename.lower().endswith('.docx'):
+            import docx
+            doc = docx.Document(BytesIO(file_bytes))
+            text = "\n".join([para.text for para in doc.paragraphs])
+        else:
+            text = file_bytes.decode('utf-8', errors='ignore')
+        
+        print(f"🧹 Cleaning text ({len(text.split())} words)...")
+        text = cleaner.clean_aggressively(text)
+        
+        if not text or len(text.strip()) < 100:
+            return jsonify({"error": "Extracted text too short"}), 400
+        
+        print(f"✅ Cleaned: {len(text.split())} words")
+        print(f"{'='*60}\n")
+        
+        PAPER_STORE.set_paper(text, filename)
+        
+        collection = build_index(text)
+        if collection is None:
+            return jsonify({"error": "Failed to build index"}), 500
+        
+        return jsonify({
+            "success": True,
+            "text": text[:500] + "..." if len(text) > 500 else text,
+            "filename": filename,
+            "word_count": len(text.split()),
+            "cleaned": True
+        })
+    
+    except Exception as e:
+        print(f"❌ ERROR: {e}")
+        import traceback
+        traceback.print_exc()
+        return jsonify({"error": str(e)}), 500
+
+@app.route('/api/get_paper', methods=['GET'])
+def get_paper():
+    return jsonify({
+        "text": PAPER_STORE.text,
+        "filename": PAPER_STORE.filename,
+        "word_count": len(PAPER_STORE.text.split()),
+        "metadata": PAPER_STORE.metadata,
+        "quality": PAPER_STORE.text_quality
+    })
+
+@app.route('/api/summarize', methods=['POST'])
+def summarize():
+    data = request.json
+    text = data.get('text', PAPER_STORE.text)
+    method = data.get('method', 'textrank')
+    num_sentences = data.get('num_sentences', 8)
+    if not text:
+        return jsonify({"error": "No text to summarize"}), 400
+    try:
+        if method == 'textrank':
+            summary = summarizer.textrank_summarize(text, num_sentences)
+        elif method == 'tfidf':
+            summary = summarizer.tfidf_summarize(text, num_sentences)
+        elif method == 'frequency':
+            summary = summarizer.frequency_summarize(text, num_sentences)
+        else:
+            summary = summarizer.textrank_summarize(text, num_sentences)
+        keywords = extract_keywords(text, 10)
+        entities = extract_entities(text)
+        user_id = session.get('user_id')
+        if user_id and user_id != 'demo_user':
+            try:
+                supabase.table("summary_history").insert({
+                    "user_id": user_id,
+                    "paper_name": PAPER_STORE.filename,
+                    "summary_method": method,
+                    "summary": summary[:2000],
+                    "created_at": datetime.now().isoformat()
+                }).execute()
+            except:
+                pass
+        return jsonify({
+            "success": True,
+            "summary": summary,
+            "word_count": len(text.split()),
+            "summary_word_count": len(summary.split()),
+            "keywords": [kw[0] for kw in keywords],
+            "entities": {k: len(v) for k, v in entities.items() if v},
+            "method": method
+        })
+    except Exception as e:
+        return jsonify({"error": f"Summarization failed: {str(e)}"}), 500
+
+def extract_keywords(text, top_n=10):
+    try:
+        vectorizer = TfidfVectorizer(max_features=50, stop_words='english', ngram_range=(1, 2))
         tfidf = vectorizer.fit_transform([text])
         feature_names = vectorizer.get_feature_names_out()
         scores = tfidf.toarray()[0]
         top_indices = scores.argsort()[-top_n:][::-1]
-        keywords = [(feature_names[i], scores[i]) for i in top_indices if scores[i] > 0]
-        return keywords
-    except Exception:
-        words = re.findall(r'\b[a-zA-Z]{3,}\b', text.lower())
-        words = [w for w in words if w not in stop_words]
+        return [(feature_names[i], scores[i]) for i in top_indices if scores[i] > 0]
+    except:
         from collections import Counter
+        words = [w for w in re.findall(r'\b[a-zA-Z]{3,}\b', text.lower()) if w not in stop_words]
         return Counter(words).most_common(top_n)
 
-# ---------- Classification Data & Setup ----------
-TECH_TEXTS = [
-    "The algorithm uses a convolutional neural network for image classification.",
-    "We propose a novel attention mechanism for transformer models.",
-    "The system achieves 95% accuracy on the test set with a p-value less than 0.05.",
-    "Our method reduces inference time by 30% using quantization.",
-    "We evaluate on several benchmarks including GLUE and SQuAD."
-]
-NON_TECH_TEXTS = [
-    "The new product is a game-changer for the industry.",
-    "This groundbreaking innovation will revolutionize the market.",
-    "Our unmatched performance sets a new standard.",
-    "The solution is user-friendly and intuitive.",
-    "We are proud to announce our latest version with amazing features."
-]
-
-def train_classifiers():
-    corpus = TECH_TEXTS + NON_TECH_TEXTS
-    labels = [1] * len(TECH_TEXTS) + [0] * len(NON_TECH_TEXTS)
-    
-    vectorizer = TfidfVectorizer()
-    X_vec = vectorizer.fit_transform(corpus)
-    
-    models = {
-        'Naive Bayes': MultinomialNB(),
-        'Logistic Regression': LogisticRegression(max_iter=1000, random_state=42),
-        'Linear SVM': LinearSVC(max_iter=1000, random_state=42, dual=False)
+def extract_entities(text):
+    doc = nlp(text[:50000])
+    entities = {
+        'PERSON': [], 'ORG': [], 'GPE': [], 'DATE': [],
+        'MONEY': [], 'PERCENT': [], 'PRODUCT': [], 'EVENT': []
     }
-    
-    fitted_models = {}
-    for name, model in models.items():
-        model.fit(X_vec, labels)
-        fitted_models[name] = model
-        
-    return fitted_models, vectorizer
-
-# ---------- Hype vs Rigor ----------
-HYPE_WORDS = [
-    "groundbreaking", "revolutionary", "unmatched", "game-changing", "never-before-seen",
-    "phenomenal", "extraordinary", "incredible", "amazing", "astonishing", "remarkable",
-    "exceptional", "fantastic", "unprecedented", "paradigm-shift", "miracle", "magic", "breakthrough"
-]
-RIGOR_WORDS = [
-    "quantitative", "p-value", "confidence interval", "sample size", "metric", "bound",
-    "statistically significant", "correlation", "causal", "controlled", "experiment",
-    "randomized", "reproducible", "robust", "validation", "test set", "training set",
-    "baseline", "benchmark", "evaluation", "accuracy", "precision", "recall", "f1"
-]
-
-def compute_hype_rigor(text: str):
-    text_lower = text.lower()
-    hype_count = sum(text_lower.count(w) for w in HYPE_WORDS)
-    rigor_count = sum(text_lower.count(w) for w in RIGOR_WORDS)
-    total_words = max(1, len(text.split()))
-    
-    hype_score = min(100, (hype_count / total_words) * 1000)
-    rigor_score = min(100, (rigor_count / total_words) * 1000)
-    
-    if re.findall(r'\b\d+(\.\d+)?\b', text):
-        rigor_score = min(100, rigor_score + 10)
-    if re.search(r'p\s*[<>=]\s*0\.\d+', text_lower):
-        rigor_score = min(100, rigor_score + 15)
-        
-    return hype_score, rigor_score
-
-# ---------- Concept Graph ----------
-def build_concept_graph(text: str):
-    doc = nlp(text)
-    nodes = set()
-    for chunk in doc.noun_chunks:
-        nodes.add(chunk.text)
     for ent in doc.ents:
-        nodes.add(ent.text)
-    for token in doc:
-        if token.pos_ in ('NOUN', 'PROPN'):
-            nodes.add(token.text)
-    nodes = list(nodes)[:30]
+        if ent.label_ in entities:
+            entities[ent.label_].append(ent.text)
+    for key in entities:
+        entities[key] = list(dict.fromkeys(entities[key]))[:10]
+    return entities
 
-    sentences = [sent.text for sent in doc.sents]
-    co_occurrence = {n: {m: 0 for m in nodes} for n in nodes}
-    for sent in sentences:
-        sent_tokens = [t.text for t in nlp(sent) if t.text in nodes]
-        for i, a in enumerate(sent_tokens):
-            for b in sent_tokens[i+1:]:
-                co_occurrence[a][b] += 1
-                co_occurrence[b][a] += 1
-
-    adj_matrix = pd.DataFrame(co_occurrence, index=nodes, columns=nodes).fillna(0)
-    G = nx.Graph()
-    for node in nodes:
-        G.add_node(node)
-    for i, a in enumerate(nodes):
-        for j, b in enumerate(nodes):
-            if i < j and adj_matrix.iloc[i, j] > 0:
-                G.add_edge(a, b, weight=adj_matrix.iloc[i, j])
-    return G, adj_matrix, nodes
-
-# ---------- Export Functions ----------
-def export_results(text, results):
-    export_data = {
-        'timestamp': datetime.now().isoformat(),
-        'text_length': len(text),
-        'word_count': len(text.split()),
-        'results': results
-    }
-    return json.dumps(export_data, indent=2)
-
-# ---------- Streamlit UI ----------
-def main():
-    st.set_page_config(layout="wide", page_title="NLP Research Assistant")
-    st.title("🧠 Advanced NLP Research Paper Analyzer")
-    st.markdown("Upload a research paper (PDF, DOCX, TXT) or paste text for comprehensive analysis.")
-
-    # ---------- Main Input Section ----------
-    st.header("📄 Input Your Research Paper")
-    col1, col2 = st.columns([2, 1])
+# ========== HYBRID RAG CHAT ==========
+@app.route('/api/chat', methods=['POST'])
+def chat():
+    data = request.json
+    question = data.get('question', '')
     
-    with col1:
-        uploaded_file = st.file_uploader(
-            "Choose a file (PDF, DOCX, TXT)",
-            type=["pdf", "docx", "txt"],
-            help="Upload a research paper to analyze. For best results, use PDF or DOCX."
+    collection = PAPER_STORE.collection
+    if collection is None:
+        return jsonify({
+            "answer": "⚠️ No paper uploaded yet. Please upload a paper first.",
+            "sources": []
+        })
+    
+    def _ollama_answer():
+        model = get_embedding_model()
+        q_emb = model.encode([question])[0]
+        results = collection.query(
+            query_embeddings=[q_emb.tolist()],
+            n_results=3
         )
-    
-    with col2:
-        use_advanced = st.checkbox("Use advanced PDF extraction (pdfplumber, better for complex layouts)", value=True)
-        st.caption("Slower but handles scanned/layout-heavy PDFs.")
-    
-    if uploaded_file is None:
-        st.info("No file uploaded. You can select a sample text or paste your own in the sidebar.")
-        st.sidebar.header("Sample or Manual Input")
-        sample_texts = {
-            "Technical Abstract": "We introduce a novel transformer-based architecture for sentiment analysis. The model achieves 92.3% accuracy on the benchmark dataset with a p-value < 0.01. Our method is reproducible and robust to noise. #NLPResearch",
-            "Hype Press Release": "Our groundbreaking AI solution is a game-changer! It's revolutionary and unmatched in the industry. Experience the future today! 💯🔥",
-            "Mixed Text with Emojis": "This is amazing 😊! But seriously, we need to consider the p-value and sample size. No more errors! #NoMoreErrors",
-            "Ambiguous Blog Post": "I think this could be important, but I'm not sure. The results are interesting. Maybe we need more data."
-        }
-        selected_sample = st.sidebar.selectbox("Choose a sample text", list(sample_texts.keys()))
-        input_text = st.sidebar.text_area("Or paste your own text:", value=sample_texts[selected_sample], height=150)
-    else:
-        with st.spinner("Extracting text from file (this may take a moment)..."):
-            input_text = extract_text_from_file(uploaded_file, use_advanced=use_advanced)
-            if not input_text:
-                st.error("Could not extract text from the file. Please try a different file or use the sample text.")
-                sample_texts = {
-                    "Technical Abstract": "We introduce a novel transformer-based architecture for sentiment analysis. The model achieves 92.3% accuracy on the benchmark dataset with a p-value < 0.01. Our method is reproducible and robust to noise. #NLPResearch"
-                }
-                input_text = st.sidebar.text_area("Fallback text:", value=sample_texts["Technical Abstract"], height=150)
-            else:
-                st.success(f"File loaded successfully! Extracted {len(input_text.split())} words.")
-                with st.expander("Preview extracted text"):
-                    st.text(input_text[:800] + "..." if len(input_text) > 800 else input_text)
-
-    # ---------- Tabs ----------
-    tabs = st.tabs([
-    "🔒 Preprocessing",          # 0
-    "📊 Vectorization",          # 1
-    "🧪 Classifier",             # 2
-    "📈 Hype vs Rigor",          # 3
-    "🔗 Concept Graph",          # 4
-    "📝 Summary",                # 5
-    "🏷️ Entities",               # 6
-    "🔑 Keywords",               # 7
-    "📊 Paper Stats",            # 8
-    "🤖 Paper Q&A",              # 9   <- RAG Chatbot
-    "🔗 Citation Network",       # 10
-    "🏷️ Classification",         # 11
-    "📊 Readability Heatmap",    # 12
-    "🔬 Methodology",            # 13
-    "📤 Export"                  # 14
-    ])
-
-    # ---------- Tab 0: Preprocessing ----------
-    with tabs[0]:
-        st.header("Safer Preprocessing & Safety Audit Pipeline")
-        if st.button("Run Preprocessing", key="preproc"):
-            with st.spinner("Preprocessing..."):
-                result = safe_preprocess(input_text)
-                naive = naive_preprocess(input_text)
-
-                col1, col2 = st.columns(2)
-                with col1:
-                    st.subheader("Naive Preprocessing")
-                    st.write("Tokens:", naive)
-                with col2:
-                    st.subheader("Safe Preprocessing")
-                    st.write("Filtered & Lemmatized Tokens:", result['lemmatized_filtered'])
-
-                st.subheader("Side-by-Side Diff")
-                diff_df = pd.DataFrame({
-                    "Naive": [", ".join(naive[:20]) + ("..." if len(naive)>20 else "")],
-                    "Safe": [", ".join(result['lemmatized_filtered'][:20]) + ("..." if len(result['lemmatized_filtered'])>20 else "")]
-                })
-                st.dataframe(diff_df)
-
-                with st.expander("Audit Log"):
-                    for entry in result['audit']:
-                        st.write(f"- {entry}")
-        else:
-            st.info("Click the button above to run preprocessing.")
-
-    # ---------- Tab 1: Vectorization ----------
-    with tabs[1]:
-        st.header("Dual Vectorization Layer")
-        preprocessed_text = ' '.join(safe_preprocess(input_text)['lemmatized_filtered'])
-        corpus = [preprocessed_text]
-
-        tfidf_vec = TfidfVectorizer(max_features=20)
-        tfidf_matrix = tfidf_vec.fit_transform(corpus)
-        feature_names = tfidf_vec.get_feature_names_out()
-        tfidf_df = pd.DataFrame(tfidf_matrix.toarray(), columns=feature_names)
-
-        st.subheader("TF-IDF Feature Weights")
-        st.dataframe(tfidf_df)
-
-        if len(feature_names) > 0:
-            top_n = min(10, len(feature_names))
-            top_indices = tfidf_matrix.toarray()[0].argsort()[-top_n:][::-1]
-            top_features = feature_names[top_indices]
-            top_weights = tfidf_matrix.toarray()[0][top_indices]
-            
-            fig, ax = plt.subplots(figsize=(8, 4))
-            ax.barh(top_features, top_weights, color='skyblue')
-            ax.set_xlabel("TF-IDF Score")
-            ax.set_title(f"Top {top_n} TF-IDF Features")
-            st.pyplot(fig)
-
-        doc = nlp(input_text)
-        words = [token.text for token in doc if token.is_alpha and not token.is_stop]
-        if len(words) >= 2:
-            word_pairs = st.multiselect("Select two words to compare via spaCy vectors", words, default=words[:2] if len(words)>=2 else [])
-            if len(word_pairs) == 2:
-                w1, w2 = word_pairs
-                vec1 = nlp(w1).vector
-                vec2 = nlp(w2).vector
-                if np.linalg.norm(vec1) > 0 and np.linalg.norm(vec2) > 0:
-                    sim = cosine_similarity([vec1], [vec2])[0][0]
-                    st.metric(f"Cosine Similarity: {w1} vs {w2}", f"{sim:.4f}")
-                    st.write(f"Vector distance (Euclidean): {np.linalg.norm(vec1 - vec2):.4f}")
-
-    # ---------- Tab 2: Classifier ----------
-    with tabs[2]:
-        st.header("Technical vs Non-Technical Classification")
-        models, vectorizer = train_classifiers()
-        
-        vec_input = vectorizer.transform([input_text])
-        st.subheader("Predictions for Current Input")
-        
-        preds = {}
-        for name, model in models.items():
-            pred = model.predict(vec_input)[0]
-            preds[name] = "Technical" if pred == 1 else "Non-Technical"
-        
-        st.write(pd.DataFrame([preds]))
-
-    # ---------- Tab 3: Hype vs Rigor ----------
-    with tabs[3]:
-        st.header("Hype vs Rigor Analysis")
-        hype, rigor = compute_hype_rigor(input_text)
-        col1, col2 = st.columns(2)
-        col1.metric("Hype Score", f"{hype:.1f} / 100")
-        col2.metric("Rigor Score", f"{rigor:.1f} / 100")
-
-    # ---------- Tab 4: Concept Graph ----------
-    with tabs[4]:
-        st.header("Concept Co-occurrence Network")
-        if st.button("Generate Concept Graph"):
-            with st.spinner("Building graph..."):
-                G, adj_matrix, nodes = build_concept_graph(input_text)
-                if len(G.edges()) > 0:
-                    fig, ax = plt.subplots(figsize=(10, 6))
-                    pos = nx.spring_layout(G)
-                    nx.draw_networkx_nodes(G, pos, ax=ax, node_color='lightblue', node_size=500)
-                    nx.draw_networkx_edges(G, pos, ax=ax, alpha=0.5)
-                    nx.draw_networkx_labels(G, pos, ax=ax, font_size=8)
-                    st.pyplot(fig)
-                else:
-                    st.info("Not enough entity/noun connections found to build a graph.")
-
-    # ---------- Tab 5: Summary ----------
-        with tabs[5]:
-            st.header("Multi-Algorithm Text Summarization")
-            
-            summary_method = st.radio(
-                "Select summarization method:",
-                ["TextRank (Graph-based)", "TF-IDF Extractive", "Sentence Frequency"]
-            )
-            
-            num_sents = st.slider("Select Summary Length (Sentences)", 1, 10, 5)
-            
-            # Debug info
-            with st.expander("📊 Text Statistics (Debug)"):
-                sentences = split_sentences(input_text)
-                st.write(f"**Total characters:** {len(input_text)}")
-                st.write(f"**Word count:** {len(input_text.split())}")
-                st.write(f"**Sentences detected:** {len(sentences)}")
-                if sentences:
-                    st.write("**First 3 sentences:**")
-                    for i, s in enumerate(sentences[:3]):
-                        st.write(f"{i+1}. {s[:150]}...")
-            
-            if st.button("Generate Summary", key="summarize"):
-                with st.spinner("Generating summary..."):
-                    if summary_method == "TextRank (Graph-based)":
-                        summary = textrank_summarize(input_text, num_sents)
-                    elif summary_method == "TF-IDF Extractive":
-                        summary = generate_summary_tfidf(input_text, num_sents)
-                    else:
-                        summary = generate_summary_frequency(input_text, num_sents)
-                    
-                    # ----- Post-filter summary sentences -----
-                    def is_bad_sentence(sent):
-                        if '?' in sent:  # questions
-                            return True
-                        if re.match(r'^[A-Z][a-z]+,\s*[A-Z]\.?\s*\(\d{4}\)', sent):  # references
-                            return True
-                        if re.match(r'^(Moving bravely|Left to my own devices|Mobile technology|Autonomy and|Profiling mobile|Computer Assisted)', sent, re.I):
-                            return True
-                        if len(re.findall(r'[A-Z][a-z]+\s*[,;]?\s*[A-Z]\.', sent)) >= 2:
-                            return True
-                        return False
-                    
-                    raw_sentences = split_sentences(summary)
-                    summary_sentences = [s for s in raw_sentences if not is_bad_sentence(s)]
-                    if not summary_sentences:
-                        summary_sentences = [summary]  # fallback
-                    
-                    st.markdown("### 📌 Key Takeaways")
-                    for sent in summary_sentences:
-                        # Bold numbers and percentages
-                        sent = re.sub(r'(\d+%|\d+\s*(?:participants|students|years))', r'**\1**', sent)
-                        # Bold key verbs
-                        for word in ['showed', 'demonstrated', 'revealed', 'indicated', 'reported', 'found']:
-                            sent = re.sub(rf'\b({word})\b', r'**\1**', sent, flags=re.I)
-                        st.markdown(f"- {sent}")
-                    
-                    st.caption(f"Original: {len(input_text.split())} words | Summary: {len(summary.split())} words")
-                    
-                    # Download button
-                    summary_md = f"""# Summary of {uploaded_file.name if uploaded_file else 'your text'}
-
-    **Method**: {summary_method}  
-    **Number of sentences**: {num_sents}  
-
-    ## Key Takeaways
-    {chr(10).join('- ' + s for s in summary_sentences)}
-
-    ---
-    *Generated by the Transparent NLP Analysis Engine*
-    """
-                    st.download_button(
-                        label="📥 Download Summary as Markdown",
-                        data=summary_md,
-                        file_name=f"summary_{datetime.now().strftime('%Y%m%d_%H%M%S')}.md",
-                        mime="text/markdown"
-                    )    
-                
-    # ---------- Tab 6: Entities ----------
-    with tabs[6]:
-        st.header("Named Entity Recognition")
-        entities = extract_entities(input_text)
-        for label, ent_list in entities.items():
-            if ent_list:
-                st.write(f"**{label}**: {', '.join(ent_list)}")
-
-    # ---------- Tab 7: Keywords ----------
-    with tabs[7]:
-        st.header("Top Keywords & Keyphrases")
-        keywords = extract_keywords(input_text, top_n=10)
-        kw_df = pd.DataFrame(keywords, columns=["Keyword", "Score/Count"])
-        st.dataframe(kw_df)
-
-    # ---------- Tab 8: Export ----------
-    with tabs[8]:
-        st.header("Export Analysis Data")
-        summary_res = textrank_summarize(input_text, num_sentences=3)
-        entities_res = extract_entities(input_text)
-        hype, rigor = compute_hype_rigor(input_text)
-        
-        results_payload = {
-            "summary": summary_res,
-            "entities": entities_res,
-            "hype_score": hype,
-            "rigor_score": rigor
-        }
-        
-        json_str = export_results(input_text, results_payload)
-        st.download_button(
-            label="Download JSON Report",
-            data=json_str,
-            file_name="nlp_analysis_report.json",
-            mime="application/json"
+        chunks = results['documents'][0]
+        context = "\n\n---\n\n".join(chunks)
+        # Research assistant persona
+        system_prompt = (
+            "You are a senior research assistant with a PhD in the relevant field. "
+            "Answer the user's question clearly and professionally, using ONLY the provided context. "
+            "Cite specific findings from the paper when relevant. "
+            "If the answer is not in the context, say 'I don't have that information.'"
         )
+        response = ollama.chat(
+            model='tinyllama:1.1b',
+            messages=[
+                {'role': 'system', 'content': system_prompt},
+                {'role': 'user', 'content': f"Context:\n{context}\n\nQuestion: {question}"}
+            ],
+            options={'temperature': 0.1, 'max_tokens': 300}
+        )
+        answer = response['message']['content'].strip()
+        return answer, chunks
     
-        # ---------- Tab 9: RAG Chatbot ----------
-    with tabs[9]:
-        st.header("🤖 Research Paper Q&A with Local LLM (Ollama)")
-        st.markdown("**Powered by Qwen2.5-Coder-1.5B** (running via Ollama) – 100% offline and private.")
-
-        if not RAG_AVAILABLE:
-            st.error("Missing dependencies. Run: pip install chromadb sentence-transformers ollama")
-        else:
-            if not input_text:
-                st.info("Please upload a research paper first.")
-            else:
-                # Load embedding model (cached)
-                @st.cache_resource
-                def load_embedding_model():
-                    return SentenceTransformer('all-MiniLM-L6-v2')
-
-                with st.spinner("Loading AI models..."):
-                    embedding_model = load_embedding_model()
-
-                # Compute a unique collection name based on the paper content
-                import hashlib
-                paper_hash = hashlib.md5(input_text[:1000].encode()).hexdigest()[:8]
-                collection_name = f"paper_chunks_{paper_hash}"
-
-                # Check if we need to (re)index
-                if ('rag_ready' not in st.session_state or 
-                    st.session_state.get('paper_hash') != paper_hash):
-                    
-                    with st.spinner("Indexing your paper for Q&A..."):
-                        def chunk_text(text, chunk_size=500, overlap=50):
-                            words = text.split()
-                            chunks = []
-                            for i in range(0, len(words), chunk_size - overlap):
-                                chunk = ' '.join(words[i:i+chunk_size])
-                                if chunk:
-                                    chunks.append(chunk)
-                            return chunks
-
-                        chunks = chunk_text(input_text)
-                        embeddings = embedding_model.encode(chunks)
-                        
-                        client = chromadb.Client()
-                        # Delete collection if it exists (from a previous run)
-                        try:
-                            client.delete_collection(collection_name)
-                        except:
-                            pass  # collection doesn't exist
-                        
-                        # Create fresh collection
-                        collection = client.create_collection(name=collection_name)
-                        for i, (chunk, emb) in enumerate(zip(chunks, embeddings)):
-                            collection.add(
-                                documents=[chunk],
-                                embeddings=[emb.tolist()],
-                                ids=[str(i)]
-                            )
-                        
-                        st.session_state.rag_collection = collection
-                        st.session_state.rag_chunks = chunks
-                        st.session_state.paper_text = input_text
-                        st.session_state.paper_hash = paper_hash
-                        st.session_state.rag_ready = True
-                    st.success(f"✅ Paper indexed! {len(chunks)} chunks ready.")
-                else:
-                    collection = st.session_state.rag_collection
-
-                # Chat interface
-                st.markdown("### 💬 Ask Questions About the Paper")
-                
-                if 'rag_messages' not in st.session_state:
-                    st.session_state.rag_messages = []
-
-                for msg in st.session_state.rag_messages:
-                    with st.chat_message(msg["role"]):
-                        st.markdown(msg["content"])
-                        if "sources" in msg:
-                            st.caption(f"📚 Sources: {', '.join(msg['sources'])}")
-
-                if prompt := st.chat_input("Ask about the research paper..."):
-                    st.session_state.rag_messages.append({"role": "user", "content": prompt})
-                    with st.chat_message("user"):
-                        st.markdown(prompt)
-
-                    with st.chat_message("assistant"):
-                        with st.spinner("Thinking..."):
-                            try:
-                                # Retrieve relevant chunks
-                                query_embedding = embedding_model.encode([prompt])[0]
-                                results = collection.query(
-                                    query_embeddings=[query_embedding.tolist()],
-                                    n_results=3
-                                )
-                                context_chunks = results['documents'][0]
-                                context = "\n\n---\n\n".join(context_chunks)
-                                
-                                # Generate with Ollama
-                                response = ollama.chat(
-                                    model='qwen2.5-coder:1.5b',
-                                    messages=[{
-                                        'role': 'user',
-                                        'content': f"You are a research assistant. Answer the question based ONLY on the provided context.\n\nContext:\n{context}\n\nQuestion: {prompt}\n\nAnswer:"
-                                    }],
-                                    options={'temperature': 0.3, 'max_tokens': 512}
-                                )
-                                answer = response['message']['content'].strip()
-                                st.markdown(answer)
-                                st.caption("📚 Sources: Chunk 1, 2, 3")
-                                with st.expander("📖 View Source Chunks"):
-                                    for i, ctx in enumerate(context_chunks):
-                                        st.markdown(f"**Source {i+1}:**")
-                                        st.text(ctx[:500] + "..." if len(ctx) > 500 else ctx)
-                                        st.divider()
-                                st.session_state.rag_messages.append({
-                                    "role": "assistant",
-                                    "content": answer,
-                                    "sources": ["Chunk 1", "Chunk 2", "Chunk 3"]
-                                })
-                            except Exception as e:
-                                st.error(f"Error: {e}\nMake sure Ollama is running (`ollama serve`) and model is pulled (`ollama pull qwen2.5-coder:1.5b`).")
-                                
-        # ---------- Tab 10: Citation Network ----------
-    with tabs[10]:
-        st.header("🔗 Citation Network Analysis")
-        st.markdown("Shows the most frequently cited authors in the paper.")
-
-        if st.button("Build Citation Network", key="citation_network"):
-            with st.spinner("Extracting citations..."):
-                # Extract all (Author, Year) citations
-                citations = re.findall(r'\(([A-Z][a-z]+\s*[,;]?\s*(?:et al\.)?\s*\d{4}[a-z]?)\)', input_text)
-                citations = [c.strip() for c in citations]
-                if not citations:
-                    st.info("No citations found in the text.")
-                else:
-                    freq = Counter(citations)
-                    top_citations = freq.most_common(20)
-                    
-                    st.subheader("Top 20 Cited References")
-                    df_citations = pd.DataFrame(top_citations, columns=["Citation", "Frequency"])
-                    st.dataframe(df_citations)
-                    
-                    # Bar chart
-                    fig, ax = plt.subplots(figsize=(10, 6))
-                    authors = [c[:30] + "..." if len(c) > 30 else c for c, _ in top_citations]
-                    counts = [count for _, count in top_citations]
-                    ax.barh(authors, counts, color='coral')
-                    ax.set_xlabel("Number of Mentions")
-                    ax.set_title("Citation Frequency")
-                    st.pyplot(fig)
-                    
-        # ---------- Tab 11: Research Field Classification ----------
-    with tabs[11]:
-        st.header("🏷️ Research Field Classification")
-        st.markdown("Automatically identifies the primary research field based on keyword matches.")
-
-        if st.button("Classify Paper", key="classify"):
-            with st.spinner("Analyzing paper..."):
-                fields = {
-                    "Computer Science": ["algorithm", "neural", "network", "data", "machine learning", "AI", "deep learning", "transformer", "model", "training"],
-                    "Linguistics/Education": ["language", "learner", "autonomy", "teaching", "student", "classroom", "vocabulary", "pronunciation", "mobile", "EFL", "ESL"],
-                    "Medicine/Biology": ["patient", "disease", "gene", "protein", "cell", "clinical", "treatment", "drug", "cancer", "COVID-19"],
-                    "Physics/Engineering": ["quantum", "particle", "mechanical", "circuit", "thermal", "energy", "force", "velocity"],
-                    "Social Sciences": ["society", "survey", "interview", "participant", "behavior", "gender", "race", "economy", "policy"],
-                    "Psychology": ["behavior", "cognition", "brain", "amygdala", "hormone", "stress", "depression", "anxiety"]
-                }
-                scores = {}
-                text_lower = input_text.lower()
-                for field, keywords in fields.items():
-                    score = sum(text_lower.count(kw) for kw in keywords)
-                    scores[field] = score
-                
-                sorted_scores = sorted(scores.items(), key=lambda x: x[1], reverse=True)
-                
-                st.markdown("### 📊 Classification Results")
-                col1, col2 = st.columns(2)
-                with col1:
-                    st.metric("Primary Field", sorted_scores[0][0])
-                    st.caption(f"*Confidence: {sorted_scores[0][1]} keyword matches*")
-                with col2:
-                    st.metric("Secondary Field", sorted_scores[1][0] if len(sorted_scores) > 1 else "N/A")
-                
-                fig, ax = plt.subplots(figsize=(10, 4))
-                fields_list = [f for f, _ in sorted_scores]
-                scores_list = [s for _, s in sorted_scores]
-                colors = plt.cm.viridis(np.linspace(0, 1, len(fields_list)))[::-1]
-                ax.barh(fields_list, scores_list, color=colors)
-                ax.set_xlabel("Keyword Matches")
-                ax.set_title("Paper Classification Scores")
-                st.pyplot(fig)
-                
-        # ---------- Tab 12: Readability Heatmap ----------
-    with tabs[12]:
-        st.header("📊 Section Readability Heatmap")
-        st.markdown("Visualizes which sections are easiest or hardest to read.")
-
-        # Helper functions (reuse from Paper Stats)
-        def flesch(text):
-            words = re.findall(r'\b[a-zA-Z]+\b', text)
-            sentences = split_sentences(text)
-            if len(sentences) == 0 or len(words) == 0:
-                return 0
-            syllables = sum(len(re.findall(r'[aeiouy]', w)) for w in words)
-            score = 206.835 - 1.015*(len(words)/len(sentences)) - 84.6*(syllables/len(words))
-            return max(0, min(100, score))
-
-        def gunning_fog(text):
-            words = re.findall(r'\b[a-zA-Z]+\b', text)
-            sentences = split_sentences(text)
-            if len(sentences) == 0 or len(words) == 0:
-                return 0
-            complex_words = sum(1 for w in words if len(re.findall(r'[aeiouy]', w)) >= 3)
-            return 0.4 * ((len(words)/len(sentences)) + 100*(complex_words/len(words)))
-
-        if st.button("Generate Readability Heatmap", key="readability_heatmap"):
-            with st.spinner("Calculating..."):
-                sections = extract_paper_structure(input_text)
-                section_data = []
-                for section_name, content in sections.items():
-                    if content and len(content.split()) > 10:
-                        section_data.append({
-                            "Section": section_name.capitalize(),
-                            "Flesch Score": flesch(content),
-                            "Gunning Fog": gunning_fog(content),
-                            "Words": len(content.split())
-                        })
-                if section_data:
-                    df_sections = pd.DataFrame(section_data)
-                    st.subheader("Section Readability Scores")
-                    st.dataframe(df_sections)
-
-                    # Heatmap
-                    fig, ax = plt.subplots(figsize=(10, 4))
-                    heatmap_data = df_sections[["Flesch Score", "Gunning Fog"]].T
-                    sns.heatmap(heatmap_data, annot=True, fmt='.1f', cmap='RdYlGn_r',
-                               xticklabels=df_sections["Section"], ax=ax)
-                    ax.set_title("Section Readability (Green = Easier)")
-                    st.pyplot(fig)
-
-                    # Hardest and easiest sections
-                    hardest = df_sections.loc[df_sections["Gunning Fog"].idxmax()]
-                    easiest = df_sections.loc[df_sections["Flesch Score"].idxmax()]
-                    st.warning(f"**Hardest Section**: {hardest['Section']} (Gunning Fog: {hardest['Gunning Fog']:.1f})")
-                    st.success(f"**Easiest Section**: {easiest['Section']} (Flesch Score: {easiest['Flesch Score']:.1f})")
-                else:
-                    st.info("Not enough content to compute readability scores.")
-                    
-        # ---------- Tab 13: Methodology Extractor ----------
-    with tabs[13]:
-        st.header("🔬 Study Methodology Extractor")
-        st.markdown("Automatically extracts key methodological details from the paper.")
-
-        if st.button("Extract Methodology", key="methodology"):
-            with st.spinner("Extracting methodology..."):
-                sections = extract_paper_structure(input_text)
-                method_text = sections.get('methodology', '')
-                if not method_text:
-                    method_text = input_text[:3000]  # fallback
-
-                methodology = {}
-                # Sample size
-                sample_match = re.search(r'(\d+)\s*(?:participants?|subjects?|students?)', method_text, re.I)
-                if sample_match:
-                    methodology['Sample Size'] = sample_match.group(1)
-                # Study design
-                design_keywords = ['semi-structured', 'structured', 'unstructured', 'interview', 'survey',
-                                   'questionnaire', 'experiment', 'case study', 'longitudinal', 'cross-sectional']
-                found_design = [kw for kw in design_keywords if kw in method_text.lower()]
-                if found_design:
-                    methodology['Study Design'] = ', '.join(found_design)
-                # Data collection
-                if 'interview' in method_text.lower():
-                    methodology['Data Collection'] = 'Interview'
-                elif 'survey' in method_text.lower() or 'questionnaire' in method_text.lower():
-                    methodology['Data Collection'] = 'Survey/Questionnaire'
-                elif 'experiment' in method_text.lower():
-                    methodology['Data Collection'] = 'Experiment'
-                else:
-                    methodology['Data Collection'] = 'Not specified'
-                # Analysis
-                analysis_keywords = ['qualitative', 'quantitative', 'mixed methods', 'statistical', 'thematic', 'content analysis']
-                found_analysis = [kw for kw in analysis_keywords if kw in method_text.lower()]
-                if found_analysis:
-                    methodology['Analysis'] = ', '.join(found_analysis)
-
-                if methodology:
-                    st.markdown("### 📋 Extracted Methodology")
-                    for key, value in methodology.items():
-                        st.metric(key, value)
-                else:
-                    st.info("Could not extract methodology. This works best with structured research papers.")
-
-                with st.expander("📄 Methodology Section Snippet"):
-                    st.text(method_text[:1000] + "..." if len(method_text) > 1000 else method_text)                
-        # ---------- Tab: Paper Stats ----------
-    with tabs[-1]:  # adjust index based on your list order
-        st.header("📊 Paper Statistics & Readability")
-        
-        # Helper functions
-        def flesch(text):
-            words = re.findall(r'\b[a-zA-Z]+\b', text)
-            sentences = split_sentences(text)
-            if len(sentences) == 0 or len(words) == 0:
-                return 0
-            # Rough syllable count
-            syllables = sum(len(re.findall(r'[aeiouy]', w)) for w in words)
-            score = 206.835 - 1.015*(len(words)/len(sentences)) - 84.6*(syllables/len(words))
-            return max(0, min(100, score))
-        
-        def gunning_fog(text):
-            words = re.findall(r'\b[a-zA-Z]+\b', text)
-            sentences = split_sentences(text)
-            if len(sentences) == 0 or len(words) == 0:
-                return 0
-            complex_words = sum(1 for w in words if len(re.findall(r'[aeiouy]', w)) >= 3)
-            return 0.4 * ((len(words)/len(sentences)) + 100*(complex_words/len(words)))
-        
-        # Compute metrics
-        words = re.findall(r'\b[a-zA-Z]+\b', input_text)
-        unique_words = set(w.lower() for w in words)
-        citations = len(re.findall(r'\([A-Z][a-z]+\s*[,;]?\s*\d{4}\)', input_text))
-        sentences = split_sentences(input_text)
-        
-        col1, col2, col3 = st.columns(3)
-        col1.metric("Flesch Reading Ease", f"{flesch(input_text):.1f}", help="Higher = easier to read")
-        col2.metric("Gunning Fog Index", f"{gunning_fog(input_text):.1f}", help="Grade level needed")
-        col3.metric("Citations Found", citations)
-        
-        col4, col5, col6 = st.columns(3)
-        col4.metric("Total Words", len(words))
-        col5.metric("Unique Words", len(unique_words))
-        col6.metric("Vocabulary Richness", f"{len(unique_words)/len(words):.3f}" if words else "0")
-        
-        # Frequency of content words
-        from collections import Counter
-        freq = Counter(w.lower() for w in words if w.lower() not in stop_words)
-        top_words = freq.most_common(15)
-        
-        if top_words:
-            st.subheader("🔝 Top 15 Most Frequent Content Words")
-            fig, ax = plt.subplots(figsize=(10, 5))
-            words_list, counts = zip(*top_words)
-            ax.barh(words_list, counts, color='skyblue')
-            ax.set_xlabel("Frequency")
-            st.pyplot(fig)
-        
-        # Word Cloud (optional, requires wordcloud library)
+    def _groq_answer():
+        model = get_embedding_model()
+        q_emb = model.encode([question])[0]
+        results = collection.query(
+            query_embeddings=[q_emb.tolist()],
+            n_results=3
+        )
+        chunks = results['documents'][0]
+        context = "\n\n---\n\n".join(chunks)
+        system_prompt = (
+            "You are a senior research assistant with a PhD. Answer clearly, cite sources from the context, and be helpful."
+        )
+        response = groq_client.chat.completions.create(
+            model="llama-3.1-8b-instant",
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": f"Context:\n{context}\n\nQuestion: {question}"}
+            ],
+            temperature=0.1,
+            max_tokens=300
+        )
+        answer = response.choices[0].message.content.strip()
+        return answer, chunks
+    
+    # ---- Hybrid logic ----
+    try:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+            future = executor.submit(_ollama_answer)
+            answer, chunks = future.result(timeout=10)
+            return jsonify({"success": True, "answer": answer, "sources": len(chunks)})
+    except concurrent.futures.TimeoutError:
         try:
-            text_to_cloud = ' '.join(w for w in words if w.lower() not in stop_words and len(w) > 2)
-            if text_to_cloud:
-                st.subheader("☁️ Word Cloud")
-                wordcloud = WordCloud(width=800, height=400, background_color='white').generate(text_to_cloud)
-                fig_wc, ax_wc = plt.subplots(figsize=(10, 4))
-                ax_wc.imshow(wordcloud, interpolation='bilinear')
-                ax_wc.axis('off')
-                st.pyplot(fig_wc)
-        except NameError:
-            pass  # wordcloud not installed, skip silently
+            answer, chunks = _groq_answer()
+            return jsonify({"success": True, "answer": answer, "sources": len(chunks)})
+        except Exception as e:
+            try:
+                model = get_embedding_model()
+                q_emb = model.encode([question])[0]
+                results = collection.query(
+                    query_embeddings=[q_emb.tolist()],
+                    n_results=1
+                )
+                chunk = results['documents'][0][0]
+                return jsonify({"success": True, "answer": chunk, "sources": 1})
+            except:
+                return jsonify({"success": False, "answer": "⏳ All AI services timed out. Please try again."}), 504
+    except Exception as e:
+        try:
+            answer, chunks = _groq_answer()
+            return jsonify({"success": True, "answer": answer, "sources": len(chunks)})
+        except:
+            return jsonify({"success": False, "answer": f"Error: {str(e)}"}), 500
 
-if __name__ == "__main__":
-    main()
+@app.route('/api/history')
+def history():
+    user_id = session.get('user_id')
+    if not user_id:
+        return jsonify({"error": "Not logged in"}), 401
+    try:
+        response = supabase.table("chat_history")\
+            .select("question, answer, created_at")\
+            .eq("user_id", user_id)\
+            .order("created_at", desc=True)\
+            .limit(20)\
+            .execute()
+        return jsonify(response.data)
+    except:
+        return jsonify({"error": "Failed to fetch history"}), 500
+
+@app.route('/api/debug_text')
+def debug_text():
+    return jsonify({
+        "preview": PAPER_STORE.text[:1000] if PAPER_STORE.text else "No text",
+        "length": len(PAPER_STORE.text),
+        "word_count": len(PAPER_STORE.text.split()),
+        "quality": PAPER_STORE.text_quality,
+        "metadata": PAPER_STORE.metadata
+    })
+
+# ========== NEW ROUTES FOR WINNING FEATURES ==========
+
+@app.route('/insights')
+def insights_page():
+    if 'user_id' not in session:
+        return redirect(url_for('login'))
+    return render_template('insights.html')
+
+@app.route('/compare')
+def compare_page():
+    if 'user_id' not in session:
+        return redirect(url_for('login'))
+    return render_template('compare.html')
+
+@app.route('/api/insights', methods=['POST'])
+def insights_api():
+    data = request.json
+    text = data.get('text', PAPER_STORE.text)
+    if not text:
+        return jsonify({"error": "No text provided"}), 400
+    insight = detect_surprising_insights(text)
+    return jsonify({"insight": insight})
+
+@app.route('/api/compare', methods=['POST'])
+def compare_api():
+    data = request.json
+    text1 = data.get('text1', '')
+    text2 = data.get('text2', '')
+    if not text1 or not text2:
+        return jsonify({"error": "Need two papers"}), 400
+    comparison = compare_papers(text1, text2)
+    return jsonify({"comparison": comparison})
+
+@app.route('/api/report', methods=['POST'])
+def report_api():
+    data = request.json
+    text = data.get('text', PAPER_STORE.text)
+    method = data.get('method', 'textrank')
+    summary = data.get('summary', '')
+    if not text:
+        return jsonify({"error": "No text"}), 400
+    keywords = extract_keywords(text, 10)
+    entities = extract_entities(text)
+    report = generate_full_report(
+        text=text,
+        summary=summary or summarizer.textrank_summarize(text, 8),
+        keywords=keywords,
+        entities=entities,
+        method=method,
+        filename=PAPER_STORE.filename or "unknown"
+    )
+    return jsonify({"report": report})
+# ========== RENDER TEMPLATES ==========
+# (We will use Flask to render the HTML pages)
+# The tabs and main UI are defined in the templates,
+# but the features are in the Python code above.
+
+@app.route('/history')
+def history_page():
+    if 'user_id' not in session:
+        return redirect(url_for('login'))
+    return render_template('history.html')
+
+if __name__ == '__main__':
+    app.run(debug=True, host='0.0.0.0', port=5000)
+    
+@app.route('/api/summary_history', methods=['GET'])
+def summary_history():
+    user_id = session.get('user_id')
+    if not user_id:
+        return jsonify({"error": "Not logged in"}), 401
+    try:
+        response = supabase.table("summary_history")\
+            .select("paper_name, summary_method, summary, created_at")\
+            .eq("user_id", user_id)\
+            .order("created_at", desc=True)\
+            .limit(20)\
+            .execute()
+        return jsonify(response.data)
+    except Exception as e:
+        print(f"Summary history error: {e}")
+        return jsonify({"error": str(e)}), 500
+        
+    

@@ -1,0 +1,73 @@
+{% extends "base.html" %}
+{% block content %}
+<h1 class="text-center mb-4">📊 Dashboard</h1>
+<p class="text-center text-muted">Welcome, {{ email }}!</p>
+
+<div class="row">
+    <div class="col-md-4">
+        <div class="card shadow">
+            <div class="card-body text-center">
+                <h1>📄</h1>
+                <h5>Upload Paper</h5>
+                <p>Upload a research paper for analysis</p>
+                <form id="uploadForm" enctype="multipart/form-data">
+                    <input type="file" name="file" class="form-control" id="fileInput" accept=".pdf,.docx,.txt">
+                    <button type="submit" class="btn btn-primary mt-2 w-100">Upload</button>
+                </form>
+                <div id="uploadResult" class="mt-2"></div>
+            </div>
+        </div>
+    </div>
+    <div class="col-md-4">
+        <div class="card shadow">
+            <div class="card-body text-center">
+                <h1>📝</h1>
+                <h5>Summarize</h5>
+                <p>Generate summary of your paper</p>
+                <a href="/summary" class="btn btn-success w-100">Go to Summary</a>
+            </div>
+        </div>
+    </div>
+    <div class="col-md-4">
+        <div class="card shadow">
+            <div class="card-body text-center">
+                <h1>🤖</h1>
+                <h5>Chat with AI</h5>
+                <p>Ask questions about your paper</p>
+                <a href="/chat" class="btn btn-info w-100 text-white">Go to Chat</a>
+            </div>
+        </div>
+    </div>
+</div>
+
+<script>
+document.getElementById('uploadForm').addEventListener('submit', async (e) => {
+    e.preventDefault();
+    const formData = new FormData(e.target);
+    const resultDiv = document.getElementById('uploadResult');
+    resultDiv.innerHTML = '<div class="spinner-border text-primary"></div> Uploading...';
+
+    const response = await fetch('/api/upload', {
+        method: 'POST',
+        body: formData
+    });
+    const result = await response.json();
+
+    if (result.text) {
+        resultDiv.innerHTML = `
+            <div class="alert alert-success">
+                <strong>✅ ${result.filename}</strong><br>
+                Words: ${result.word_count}
+                <br><small class="text-muted">Paper is now available in Summary and Chat tabs.</small>
+            </div>
+        `;
+    } else {
+        resultDiv.innerHTML = `
+            <div class="alert alert-danger">
+                ❌ Upload failed: ${result.error}
+            </div>
+        `;
+    }
+});
+</script>
+{% endblock %}

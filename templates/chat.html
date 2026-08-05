@@ -1,0 +1,110 @@
+{% extends "base.html" %}
+{% block content %}
+<h1>🤖 Chat with Your Paper</h1>
+
+<div class="alert alert-info">
+    <strong>📄 Current Paper:</strong> <span id="paperName">Loading...</span>
+    <button id="loadPaperBtn" class="btn btn-sm btn-outline-primary ms-2">🔄 Load Paper</button>
+</div>
+
+<div class="row">
+    <div class="col-md-8">
+        <div id="chatMessages" class="border rounded p-3" style="height: 400px; overflow-y: scroll; background: #fff;">
+            <div class="text-center text-muted">Upload or paste a paper, then ask questions.</div>
+        </div>
+        <div class="input-group mt-3">
+            <input type="text" id="chatInput" class="form-control" placeholder="Ask about the paper...">
+            <button id="sendBtn" class="btn btn-primary">Send</button>
+        </div>
+    </div>
+    <div class="col-md-4">
+        <div class="card shadow">
+            <div class="card-body">
+                <h6>💡 Tips</h6>
+                <ul class="small">
+                    <li>Ask about findings, methodology, or conclusions</li>
+                    <li>Example: "What were the main results?"</li>
+                    <li>Example: "What methods did the authors use?"</li>
+                </ul>
+                <button id="clearChatBtn" class="btn btn-sm btn-outline-danger w-100">Clear Chat</button>
+            </div>
+        </div>
+    </div>
+</div>
+
+<script>
+let paperText = '';
+
+async function loadPaper() {
+    try {
+        const response = await fetch('/api/get_paper');
+        const data = await response.json();
+        if (data.text) {
+            paperText = data.text;
+            document.getElementById('paperName').textContent = data.filename || 'Uploaded paper';
+            document.getElementById('chatMessages').innerHTML = `
+                <div class="alert alert-success">✅ Paper loaded: ${data.filename} (${data.word_count} words)</div>
+            `;
+        } else {
+            document.getElementById('paperName').textContent = '❌ No paper uploaded.';
+        }
+    } catch (error) {
+        console.error('Error loading:', error);
+        document.getElementById('paperName').textContent = '⚠️ Error loading paper.';
+    }
+}
+
+loadPaper();
+document.getElementById('loadPaperBtn').addEventListener('click', loadPaper);
+
+// Send message
+document.getElementById('sendBtn').addEventListener('click', async () => {
+    const question = document.getElementById('chatInput').value;
+    if (!question) return;
+    if (!paperText) {
+        alert('Please load a paper first.');
+        return;
+    }
+
+    const chatMessages = document.getElementById('chatMessages');
+    chatMessages.innerHTML += `<div class="alert alert-primary"><strong>You:</strong> ${question}</div>`;
+    document.getElementById('chatInput').value = '';
+    chatMessages.scrollTop = chatMessages.scrollHeight;
+
+    // Thinking indicator
+    const thinkingDiv = document.createElement('div');
+    thinkingDiv.className = 'alert alert-secondary';
+    thinkingDiv.innerHTML = '<span class="spinner-border spinner-border-sm"></span> Thinking...';
+    chatMessages.appendChild(thinkingDiv);
+    chatMessages.scrollTop = chatMessages.scrollHeight;
+
+    try {
+        const response = await fetch('/api/chat', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ question, context: paperText })
+        });
+        const result = await response.json();
+
+        thinkingDiv.remove();
+        chatMessages.innerHTML += `<div class="alert alert-success"><strong>🤖 AI:</strong> ${result.answer}</div>`;
+        chatMessages.scrollTop = chatMessages.scrollHeight;
+    } catch (error) {
+        thinkingDiv.remove();
+        chatMessages.innerHTML += `<div class="alert alert-danger"><strong>Error:</strong> ${error.message}</div>`;
+        chatMessages.scrollTop = chatMessages.scrollHeight;
+    }
+});
+
+document.getElementById('clearChatBtn').addEventListener('click', () => {
+    document.getElementById('chatMessages').innerHTML = `
+        <div class="text-center text-muted">Chat cleared.</div>
+    `;
+});
+
+// Enter key
+document.getElementById('chatInput').addEventListener('keyup', (e) => {
+    if (e.key === 'Enter') document.getElementById('sendBtn').click();
+});
+</script>
+{% endblock %}
