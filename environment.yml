@@ -1,0 +1,5 @@
+name: nlp_bootcamp
+channels:
+  - defaults
+dependencies: []
+prefix: /home/destructo_49/miniconda3/envs/nlp_bootcamp
